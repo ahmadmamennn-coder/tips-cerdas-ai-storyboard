@@ -18,12 +18,12 @@ function json(data, status = 200) {
   });
 }
 
-function extractText(result) {
+function getText(result) {
   if (typeof result === "string") return result;
 
   if (!result || typeof result !== "object") return "";
 
-  const possible = [
+  const candidates = [
     result.response,
     result.output_text,
     result.text,
@@ -32,130 +32,45 @@ function extractText(result) {
     result.content?.[0]?.text
   ];
 
-  for (const value of possible) {
-    if (typeof value === "string" && value.trim()) {
-      return value;
+  for (const item of candidates) {
+    if (typeof item === "string" && item.trim()) {
+      return item;
     }
   }
 
   return JSON.stringify(result);
 }
 
-function parseJSON(raw) {
+function parseAIJSON(raw) {
   const cleaned = raw
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
 
-  for (let start = 0; start < cleaned.length; start++) {
-    const first = cleaned[start];
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
 
-    if (first !== "{" && first !== "[") continue;
-
-    const stack = [];
-    let inString = false;
-    let escaped = false;
-
-    for (let i = start; i < cleaned.length; i++) {
-      const char = cleaned[i];
-
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (char === "\\") {
-          escaped = true;
-        } else if (char === '"') {
-          inString = false;
-        }
-        continue;
-      }
-
-      if (char === '"') {
-        inString = true;
-        continue;
-      }
-
-      if (char === "{" || char === "[") {
-        stack.push(char);
-      } else if (char === "}" || char === "]") {
-        const last = stack.pop();
-
-        if (
-          (char === "}" && last !== "{") ||
-          (char === "]" && last !== "[")
-        ) {
-          break;
-        }
-
-        if (stack.length === 0) {
-          try {
-            return JSON.parse(cleaned.slice(start, i + 1));
-          } catch {
-            break;
-          }
-        }
-      }
-    }
+  if (start === -1 || end <= start) {
+    throw new Error("AI tidak memberikan format JSON yang benar.");
   }
 
-  throw new Error("AI memberikan respons yang bukan JSON valid.");
+  return JSON.parse(cleaned.slice(start, end + 1));
 }
 
-function findScenes(data, depth = 0) {
-  if (!data || depth > 6) return null;
+function normalizeScenes(data) {
+  if (Array.isArray(data.scenes)) return data.scenes;
 
-  if (Array.isArray(data)) {
-    if (
-      data.length &&
-      data.some(item =>
-        item &&
-        typeof item === "object" &&
-        (
-          item.visualPrompt ||
-          item.visual_prompt ||
-          item.cameraDirection ||
-          item.narration ||
-          item.description
-        )
-      )
-    ) {
-      return data;
-    }
-
-    for (const item of data) {
-      const found = findScenes(item, depth + 1);
-      if (found) return found;
-    }
-
-    return null;
-  }
-
-  if (typeof data !== "object") return null;
-
-  const preferredKeys = [
-    "scenes",
-    "storyboard",
-    "shots",
-    "episodes",
-    "data",
-    "output",
-    "result",
-    "response"
+  const alternatives = [
+    data.storyboard,
+    data.shots,
+    data.episodes,
+    data.data?.scenes,
+    data.output?.scenes,
+    data.result?.scenes,
+    data.response?.scenes
   ];
 
-  for (const key of preferredKeys) {
-    if (data[key] !== undefined) {
-      const found = findScenes(data[key], depth + 1);
-      if (found) return found;
-    }
-  }
-
-  for (const value of Object.values(data)) {
-    const found = findScenes(value, depth + 1);
-    if (found) return found;
-  }
-
-  return null;
+  return alternatives.find(Array.isArray) || [];
 }
 
 function normalizeScene(scene, index) {
@@ -185,6 +100,39 @@ function normalizeScene(scene, index) {
   };
 }
 
+async function generateImage(env, scene, style) {
+  if (!scene.visualPrompt) {
+    return {
+      imageError: "Prompt gambar tidak tersedia."
+    };
+  }
+
+  try {
+    const result = await env.AI.run(IMAGE_MODEL, {
+      prompt:
+        `Cinematic storyboard frame, ${style} style. ` +
+        `${scene.visualPrompt}. ` +
+        "Professional composition, cinematic lighting, " +
+        "consistent characters, no text, no watermark.",
+      steps: 4
+    });
+
+    if (result && typeof result.image === "string") {
+      return {
+        image: "data:image/jpeg;base64," + result.image
+      };
+    }
+
+    return {
+      imageError: "Model gambar tidak mengembalikan gambar."
+    };
+  } catch (error) {
+    return {
+      imageError: error.message || "Gagal membuat gambar."
+    };
+  }
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -205,7 +153,9 @@ export default {
       url.pathname !== "/api/generate" ||
       request.method !== "POST"
     ) {
-      return json({ error: "Endpoint tidak ditemukan." }, 404);
+      return json({
+        error: "Endpoint tidak ditemukan."
+      }, 404);
     }
 
     if (!env.AI) {
@@ -221,48 +171,44 @@ export default {
       const language =
         body.language === "en" ? "English" : "Indonesian";
       const style = String(body.style || "cinematic");
+
       const count = [5, 10, 15].includes(Number(body.scenes))
         ? Number(body.scenes)
         : 5;
 
       if (!idea || idea.length > 2000) {
         return json({
-          error: "Ide cerita wajib diisi (maksimal 2000 karakter)."
+          error: "Masukkan ide cerita maksimal 2000 karakter."
         }, 400);
       }
 
       const prompt = `
-Create an original cinematic storyboard.
+Create a professional cinematic storyboard.
 
+Story idea: ${idea}
 Language: ${language}
 Visual style: ${style}
-Story idea: ${idea}
 
-Create exactly ${count} scenes.
+Create exactly ${count} connected scenes.
+Keep all characters visually consistent.
 
-Keep the same characters visually consistent
-throughout the entire story.
-
-Return ONLY valid JSON.
-Do not use markdown or code fences.
-
-Use exactly this structure:
+Return ONLY valid JSON in this format:
 {
   "title": "Story title",
   "logline": "Short story summary",
   "scenes": [
     {
       "title": "Scene title",
-      "visualPrompt": "Detailed image prompt in English",
+      "visualPrompt": "Detailed visual description in English",
       "cameraDirection": "Camera angle and movement",
       "narration": "Narration in requested language",
-      "sound": "Sound design description"
+      "sound": "Sound design"
     }
   ]
 }
 
-Every scene must have all five fields.
-Make the scenes distinct and connected.
+Every scene must contain all five fields.
+Do not include markdown or explanations.
 `;
 
       const textResult = await env.AI.run(TEXT_MODEL, {
@@ -270,7 +216,7 @@ Make the scenes distinct and connected.
           {
             role: "system",
             content:
-              "You are a professional screenwriter and storyboard artist. Return valid JSON only."
+              "You are a professional film screenwriter and storyboard artist. Return valid JSON only."
           },
           {
             role: "user",
@@ -281,63 +227,43 @@ Make the scenes distinct and connected.
         temperature: 0.7
       });
 
-      const raw = extractText(textResult);
-      const parsed = parseJSON(raw);
+      const parsed = parseAIJSON(getText(textResult));
+      const scenes = normalizeScenes(parsed);
 
-      const scenes = findScenes(parsed);
-
-      if (!scenes || scenes.length === 0) {
-        return json({
-          error: "AI belum menghasilkan daftar adegan. Coba lagi dengan ide cerita yang lebih sederhana."
-        }, 502);
+      if (!scenes.length) {
+        throw new Error(
+          "AI belum menghasilkan daftar adegan. Coba lagi."
+        );
       }
 
       const story = {
-        title:
-          parsed.title ||
-          parsed.storyTitle ||
-          "Untitled Storyboard",
-        logline:
-          parsed.logline ||
-          parsed.summary ||
-          "",
-        scenes: scenes
-          .slice(0, count)
-          .map(normalizeScene)
+        title: parsed.title || "Untitled Storyboard",
+        logline: parsed.logline || parsed.summary || "",
+        scenes: scenes.slice(0, count).map(normalizeScene)
       };
 
-      for (let i = 0; i < story.scenes.length; i++) {
-        const scene = story.scenes[i];
+      // Generate images in small batches.
+      const batchSize = 3;
 
-        if (!scene.visualPrompt) {
-          scene.imageError = "Prompt gambar tidak tersedia.";
-          continue;
-        }
+      for (
+        let start = 0;
+        start < story.scenes.length;
+        start += batchSize
+      ) {
+        const batch = story.scenes.slice(
+          start,
+          start + batchSize
+        );
 
-        try {
-          const imageResult = await env.AI.run(IMAGE_MODEL, {
-            prompt:
-              `Cinematic storyboard frame, ${style} visual style. ` +
-              `${scene.visualPrompt}. ` +
-              "Professional film lighting, beautiful composition, " +
-              "consistent characters, no text, no watermark.",
-            steps: 4
-          });
+        const images = await Promise.all(
+          batch.map(scene =>
+            generateImage(env, scene, style)
+          )
+        );
 
-          if (
-            imageResult &&
-            typeof imageResult.image === "string"
-          ) {
-            scene.image =
-              "data:image/jpeg;base64," + imageResult.image;
-          } else {
-            scene.imageError =
-              "Model gambar tidak mengembalikan gambar.";
-          }
-        } catch (error) {
-          scene.imageError =
-            "Gagal membuat gambar adegan ini.";
-        }
+        batch.forEach((imageData, index) => {
+          Object.assign(batch[index], imageData);
+        });
       }
 
       return json({
@@ -349,8 +275,7 @@ Make the scenes distinct and connected.
 
     } catch (error) {
       return json({
-        error:
-          error.message ||
+        error: error.message ||
           "Terjadi kesalahan pada server."
       }, 500);
     }
