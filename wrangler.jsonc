@@ -1,0 +1,10 @@
+
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tips-cerdas-ai-storyboard",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-12",
+  "ai": {
+    "binding": "AI"
+  }
+}
