@@ -18,80 +18,206 @@ function json(data, status = 200) {
   });
 }
 
-function getText(result) {
+// Membaca berbagai format respons Gemma.
+function extractText(result) {
   if (typeof result === "string") return result;
-
   if (!result || typeof result !== "object") return "";
 
+  const content = result.choices?.[0]?.message?.content;
+
   const candidates = [
+    content,
     result.response,
     result.output_text,
     result.text,
     result.result?.response,
-    result.result?.text,
-    result.content?.[0]?.text
+    result.result?.choices?.[0]?.message?.content,
+    result.message?.content
   ];
 
-  for (const item of candidates) {
-    if (typeof item === "string" && item.trim()) {
-      return item;
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      const combined = value
+        .map(item => item?.text || "")
+        .join("\n");
+
+      if (combined.trim()) return combined;
     }
   }
 
-  return JSON.stringify(result);
+  return "";
 }
 
+// Mengambil JSON object atau array dari respons AI.
 function parseAIJSON(raw) {
   const cleaned = raw
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
 
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
+  const startObject = cleaned.indexOf("{");
+  const startArray = cleaned.indexOf("[");
 
-  if (start === -1 || end <= start) {
-    throw new Error("AI tidak memberikan format JSON yang benar.");
+  let start;
+
+  if (startObject === -1) start = startArray;
+  else if (startArray === -1) start = startObject;
+  else start = Math.min(startObject, startArray);
+
+  if (start === -1) {
+    throw new Error("Respons AI tidak berisi JSON.");
   }
 
-  return JSON.parse(cleaned.slice(start, end + 1));
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < cleaned.length; i++) {
+    const char = cleaned[i];
+
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{" || char === "[") {
+      stack.push(char);
+      continue;
+    }
+
+    if (char === "}" || char === "]") {
+      const opening = stack.pop();
+
+      if (
+        (char === "}" && opening !== "{") ||
+        (char === "]" && opening !== "[")
+      ) {
+        break;
+      }
+
+      if (stack.length === 0) {
+        return JSON.parse(cleaned.slice(start, i + 1));
+      }
+    }
+  }
+
+  throw new Error("Respons JSON AI tidak lengkap.");
 }
 
-function normalizeScenes(data) {
-  if (Array.isArray(data.scenes)) return data.scenes;
+// Mencari daftar adegan meskipun berada di dalam object lain.
+function findScenes(data, depth = 0) {
+  if (!data || depth > 7) return null;
 
-  const alternatives = [
-    data.storyboard,
-    data.shots,
-    data.episodes,
-    data.data?.scenes,
-    data.output?.scenes,
-    data.result?.scenes,
-    data.response?.scenes
+  if (Array.isArray(data)) {
+    const looksLikeScenes = data.some(item =>
+      item &&
+      typeof item === "object" &&
+      (
+        item.visualPrompt ||
+        item.visual_prompt ||
+        item.imagePrompt ||
+        item.cameraDirection ||
+        item.narration
+      )
+    );
+
+    if (looksLikeScenes) return data;
+
+    for (const item of data) {
+      const found = findScenes(item, depth + 1);
+      if (found) return found;
+    }
+
+    return null;
+  }
+
+  if (typeof data !== "object") return null;
+
+  const keys = [
+    "scenes",
+    "storyboard",
+    "shots",
+    "episodes",
+    "data",
+    "output",
+    "result",
+    "response"
   ];
 
-  return alternatives.find(Array.isArray) || [];
+  for (const key of keys) {
+    if (data[key] !== undefined) {
+      const found = findScenes(data[key], depth + 1);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+function findStoryInfo(data) {
+  if (!data || typeof data !== "object") return {};
+
+  if (Array.isArray(data)) return {};
+
+  const title =
+    data.title ||
+    data.storyTitle ||
+    data.story_title;
+
+  const logline =
+    data.logline ||
+    data.summary ||
+    data.description;
+
+  if (title || logline) {
+    return { title, logline };
+  }
+
+  for (const key of ["data", "output", "result", "response"]) {
+    const found = findStoryInfo(data[key]);
+    if (found.title || found.logline) return found;
+  }
+
+  return {};
 }
 
 function normalizeScene(scene, index) {
   return {
-    title: scene.title || scene.name || `Adegan ${index + 1}`,
+    title:
+      scene.title ||
+      scene.name ||
+      `Adegan ${index + 1}`,
+
     visualPrompt:
       scene.visualPrompt ||
       scene.visual_prompt ||
       scene.imagePrompt ||
       scene.description ||
       "",
+
     cameraDirection:
       scene.cameraDirection ||
       scene.camera_direction ||
       scene.camera ||
       "",
+
     narration:
       scene.narration ||
       scene.voiceover ||
       scene.dialogue ||
       "",
+
     sound:
       scene.sound ||
       scene.soundDesign ||
@@ -100,31 +226,31 @@ function normalizeScene(scene, index) {
   };
 }
 
+// Membuat satu gambar.
 async function generateImage(env, scene, style) {
   if (!scene.visualPrompt) {
-    return {
-      imageError: "Prompt gambar tidak tersedia."
-    };
+    return { imageError: "Deskripsi gambar kosong." };
   }
 
   try {
     const result = await env.AI.run(IMAGE_MODEL, {
-      prompt:
-        `Cinematic storyboard frame, ${style} style. ` +
+      prompt: (
+        `Cinematic storyboard frame, ${style} visual style. ` +
         `${scene.visualPrompt}. ` +
-        "Professional composition, cinematic lighting, " +
-        "consistent characters, no text, no watermark.",
+        "Professional lighting, beautiful composition, " +
+        "consistent characters, no text, no watermark."
+      ).slice(0, 2048),
       steps: 4
     });
 
-    if (result && typeof result.image === "string") {
+    if (typeof result?.image === "string" && result.image) {
       return {
         image: "data:image/jpeg;base64," + result.image
       };
     }
 
     return {
-      imageError: "Model gambar tidak mengembalikan gambar."
+      imageError: "Model tidak mengembalikan data gambar."
     };
   } catch (error) {
     return {
@@ -168,8 +294,12 @@ export default {
       const body = await request.json();
 
       const idea = String(body.idea || "").trim();
+
       const language =
-        body.language === "en" ? "English" : "Indonesian";
+        body.language === "en"
+          ? "English"
+          : "Indonesian";
+
       const style = String(body.style || "cinematic");
 
       const count = [5, 10, 15].includes(Number(body.scenes))
@@ -178,7 +308,7 @@ export default {
 
       if (!idea || idea.length > 2000) {
         return json({
-          error: "Masukkan ide cerita maksimal 2000 karakter."
+          error: "Ide cerita wajib diisi, maksimal 2000 karakter."
         }, 400);
       }
 
@@ -189,17 +319,21 @@ Story idea: ${idea}
 Language: ${language}
 Visual style: ${style}
 
-Create exactly ${count} connected scenes.
-Keep all characters visually consistent.
+Create exactly ${count} scenes.
 
-Return ONLY valid JSON in this format:
+Keep the main characters visually consistent.
+
+Return ONLY valid JSON.
+No markdown fences. No explanation.
+
+Required structure:
 {
   "title": "Story title",
   "logline": "Short story summary",
   "scenes": [
     {
       "title": "Scene title",
-      "visualPrompt": "Detailed visual description in English",
+      "visualPrompt": "Detailed image description in English",
       "cameraDirection": "Camera angle and movement",
       "narration": "Narration in requested language",
       "sound": "Sound design"
@@ -208,52 +342,62 @@ Return ONLY valid JSON in this format:
 }
 
 Every scene must contain all five fields.
-Do not include markdown or explanations.
 `;
 
-      const textResult = await env.AI.run(TEXT_MODEL, {
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a professional film screenwriter and storyboard artist. Return valid JSON only."
-          },
-          {
-            role: "user",
-            content: prompt
+      // 1. Generate the complete story.
+      const textResult = await env.AI.run(
+        TEXT_MODEL,
+        {
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a professional screenwriter. Return valid JSON only."
+            },
+            {
+              role: "user",
+              content: prompt
+            }
+          ],
+          max_tokens: 6000,
+          temperature: 0.5,
+          chat_template_kwargs: {
+            enable_thinking: false
           }
-        ],
-        max_tokens: 6000,
-        temperature: 0.7
-      });
+        }
+      );
 
-      const parsed = parseAIJSON(getText(textResult));
-      const scenes = normalizeScenes(parsed);
+      // 2. Read the actual model response.
+      const raw = extractText(textResult);
 
-      if (!scenes.length) {
+      if (!raw) {
         throw new Error(
-          "AI belum menghasilkan daftar adegan. Coba lagi."
+          "Respons teks AI kosong atau formatnya tidak dikenali."
         );
       }
 
+      const parsed = parseAIJSON(raw);
+      const scenes = findScenes(parsed);
+
+      if (!scenes || scenes.length === 0) {
+        throw new Error(
+          "AI belum menghasilkan daftar adegan. Coba ulangi."
+        );
+      }
+
+      const info = findStoryInfo(parsed);
+
       const story = {
-        title: parsed.title || "Untitled Storyboard",
-        logline: parsed.logline || parsed.summary || "",
-        scenes: scenes.slice(0, count).map(normalizeScene)
+        title: info.title || "Tips Cerdas Storyboard",
+        logline: info.logline || "",
+        scenes: scenes
+          .slice(0, count)
+          .map(normalizeScene)
       };
 
-      // Generate images in small batches.
-      const batchSize = 3;
-
-      for (
-        let start = 0;
-        start < story.scenes.length;
-        start += batchSize
-      ) {
-        const batch = story.scenes.slice(
-          start,
-          start + batchSize
-        );
+      // 3. Generate images in small batches.
+      for (let i = 0; i < story.scenes.length; i += 2) {
+        const batch = story.scenes.slice(i, i + 2);
 
         const images = await Promise.all(
           batch.map(scene =>
@@ -261,11 +405,12 @@ Do not include markdown or explanations.
           )
         );
 
-        batch.forEach((imageData, index) => {
+        images.forEach((imageData, index) => {
           Object.assign(batch[index], imageData);
         });
       }
 
+      // 4. Return complete storyboard.
       return json({
         success: true,
         title: story.title,
@@ -275,6 +420,7 @@ Do not include markdown or explanations.
 
     } catch (error) {
       return json({
+        success: false,
         error: error.message ||
           "Terjadi kesalahan pada server."
       }, 500);
