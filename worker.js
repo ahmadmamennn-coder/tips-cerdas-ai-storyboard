@@ -86,9 +86,24 @@ Make every scene visually distinct and connected to the same story.
         temperature: 0.7
       });
 
-      let raw = textResult.response || textResult.result?.response || "";
+      let raw = "";
 
-      raw = raw.replace(/```json|```/g, "").trim();
+if (typeof textResult === "string") {
+  raw = textResult;
+} else {
+  raw =
+    textResult?.response ||
+    textResult?.result?.response ||
+    textResult?.output_text ||
+    textResult?.text ||
+    "";
+}
+
+if (!raw && textResult) {
+  raw = JSON.stringify(textResult);
+}
+
+raw = raw.replace(/```json|```/g, "").trim();
 
       const start = raw.indexOf("{");
       const end = raw.lastIndexOf("}");
